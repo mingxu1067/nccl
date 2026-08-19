@@ -248,6 +248,88 @@ __device__ __forceinline__ void reduceCopy(int thread, int nThreads, uint64_t re
                                                /*&*/ nBytesBehind, /*&*/ nBytesAhead);
 }
 
+// Same control flow as reduceCopyPacks, but source 0 is BF16 expanded into a
+// FP32 accumulator pack.  The received source and non-final destination stay
+// FP32.  Keeping nBytesBehind/nBytesAhead semantics identical is essential for
+// partial-hunk ownership and warp rotation.
+template <int Unroll, int BytePerPack, bool Recv, bool Bf16Output, typename IntBytes>
+__device__ __forceinline__ void reduceCopyPacksBf16Local(int nThreads, int& thread, const __nv_bfloat16* local,
+                                                         const float* remote, float* fp32Out, __nv_bfloat16* bf16Out,
+                                                         IntBytes& nBytesBehind, IntBytes& nBytesAhead) {
+  constexpr int LocalBytePerPack = BytePerPack / 2;
+  constexpr int BytePerHunk = Unroll * WARP_SIZE * BytePerPack;
+  int nWarps = nThreads / WARP_SIZE, warp = thread / WARP_SIZE, lane = thread % WARP_SIZE;
+  IntBytes threadBytesBehind = nBytesBehind + warp * BytePerHunk + lane * BytePerPack;
+  IntBytes threadBytesAhead = nBytesAhead - (warp * BytePerHunk + lane * BytePerPack);
+  IntBytes nHunksAhead = nBytesAhead / BytePerHunk;
+  nBytesBehind += nHunksAhead * BytePerHunk;
+  nBytesAhead -= nHunksAhead * BytePerHunk;
+  if (Unroll == 1 && BytePerPack <= nBytesAhead) {
+    nHunksAhead += 1;
+    nBytesBehind += nBytesAhead - nBytesAhead % BytePerPack;
+    nBytesAhead %= BytePerPack;
+  }
+  nHunksAhead -= warp;
+  uintptr_t localPtr = cvta_to_global(local) + threadBytesBehind / 2;
+  uintptr_t remotePtr = Recv ? cvta_to_global(remote) + threadBytesBehind : 0;
+  uintptr_t outPtr = Bf16Output ? cvta_to_global(bf16Out) + threadBytesBehind / 2
+                                : cvta_to_global(fp32Out) + threadBytesBehind;
+  while (Unroll == 1 ? (BytePerPack <= threadBytesAhead) : (0 < nHunksAhead)) {
+    BytePack<BytePerPack> acc[Unroll];
+    NVCC_PRAGMA_UNROLL(Unroll)
+    for (int u = 0; u < Unroll; ++u) {
+      acc[u] = applyCast<__nv_bfloat16, float>(ld_volatile_global<LocalBytePerPack>(localPtr));
+      localPtr += WARP_SIZE * LocalBytePerPack;
+    }
+    if (Recv) {
+      NVCC_PRAGMA_UNROLL(Unroll)
+      for (int u = 0; u < Unroll; ++u) {
+        acc[u] = applyReduce(FuncSum<float>{}, acc[u], ld_volatile_global<BytePerPack>(remotePtr));
+        remotePtr += WARP_SIZE * BytePerPack;
+      }
+    }
+    NVCC_PRAGMA_UNROLL(Unroll)
+    for (int u = 0; u < Unroll; ++u) {
+      if (Bf16Output) st_global<LocalBytePerPack>(outPtr, applyCast<float, __nv_bfloat16>(acc[u]));
+      else st_global<BytePerPack>(outPtr, acc[u]);
+      outPtr += WARP_SIZE * (Bf16Output ? LocalBytePerPack : BytePerPack);
+    }
+    nWarps = nThreads / WARP_SIZE;
+    localPtr += (nWarps - 1) * BytePerHunk / 2;
+    if (Recv) remotePtr += (nWarps - 1) * BytePerHunk;
+    outPtr += (nWarps - 1) * BytePerHunk / (Bf16Output ? 2 : 1);
+    threadBytesBehind += nWarps * BytePerHunk;
+    threadBytesAhead -= nWarps * BytePerHunk;
+    nHunksAhead -= nWarps;
+  }
+  nWarps = nThreads / WARP_SIZE; warp = thread / WARP_SIZE; lane = thread % WARP_SIZE;
+  if (Unroll == 1 && nHunksAhead > 0) nHunksAhead -= nWarps;
+  warp = -nHunksAhead; thread = warp * WARP_SIZE + lane;
+}
+
+template <bool Recv, bool Bf16Output>
+__device__ __forceinline__ void reduceCopyBf16Local(int thread, int nThreads, const __nv_bfloat16* local,
+                                                     const float* remote, float* fp32Out, __nv_bfloat16* bf16Out,
+                                                     ssize_t nElts) {
+  ssize_t nBytesBehind = 0, nBytesAhead = nElts * sizeof(float);
+  bool aligned = (cvta_to_global(local) % 8 == 0) && (!Recv || cvta_to_global(remote) % 16 == 0) &&
+                 (Bf16Output ? cvta_to_global(bf16Out) % 8 == 0 : cvta_to_global(fp32Out) % 16 == 0);
+  aligned = __all_sync(~0u, aligned);
+  if (aligned) {
+    reduceCopyPacksBf16Local<8, 16, Recv, Bf16Output>(nThreads, thread, local, remote, fp32Out, bf16Out,
+                                                       nBytesBehind, nBytesAhead);
+    if (nBytesAhead == 0) return;
+    reduceCopyPacksBf16Local<1, 16, Recv, Bf16Output>(nThreads, thread, local, remote, fp32Out, bf16Out,
+                                                       nBytesBehind, nBytesAhead);
+    if (nBytesAhead == 0) return;
+  }
+  reduceCopyPacksBf16Local<2, 4, Recv, Bf16Output>(nThreads, thread, local, remote, fp32Out, bf16Out,
+                                                    nBytesBehind, nBytesAhead);
+  if (nBytesAhead == 0) return;
+  reduceCopyPacksBf16Local<1, 4, Recv, Bf16Output>(nThreads, thread, local, remote, fp32Out, bf16Out,
+                                                    nBytesBehind, nBytesAhead);
+}
+
 template <int Unroll, typename RedFn, typename T, int MultimemSrcs, int MinSrcs, int MaxSrcs, int MultimemDsts,
           int MinDsts, int MaxDsts, int PreOpSrcs, typename IntBytes>
 __device__ __forceinline__ void reduceCopy(int thread, int nThreads, uint64_t redArg, bool postOp, int nSrcs,

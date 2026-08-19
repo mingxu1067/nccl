@@ -54,12 +54,46 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
     prims.recvReduceCopy(offset, dataOffset, nelem, /*postOp=*/true);
   }
 }
+
+// Fused BF16 user-I/O / FP32 Ring-Simple ReduceScatter.  The input conversion
+// is performed by the collective CTA immediately before that channel's Ring
+// steps; the per-link FIFO and every reduction use float.
+template <typename Proto>
+__device__ __forceinline__ void runRingBf16Acc(int tid, int nthreads, struct ncclDevWorkColl* work) {
+  ncclRing* ring = &ncclShmem.channel.ring;
+  int const* ringRanks = ring->userRanks;
+  const int nranks = ncclShmem.comm.nRanks;
+  size_t count, gridOffset, channelCount, chunkCount;
+  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(float), &count, &gridOffset, &channelCount, &chunkCount);
+  const __nv_bfloat16* inputBf16 = static_cast<const __nv_bfloat16*>(work->sendbuff);
+  __nv_bfloat16* outputBf16 = static_cast<__nv_bfloat16*>(work->recvbuff);
+  Primitives<float, FuncSum<float>, FanSymmetric<1>, 0, Proto, 0> prims(
+      tid, nthreads, &ring->prev, &ring->next, nullptr, nullptr, work->redOpArg);
+  for (size_t elemOffset = 0; elemOffset < channelCount; elemOffset += chunkCount) {
+    const uint32_t nelem = min(chunkCount, channelCount - elemOffset);
+    const size_t dataOffset = gridOffset + elemOffset;
+    int rankDest = ringRanks[nranks - 1];
+    size_t offset = dataOffset + rankDest * count;
+    prims.sendBf16Input(inputBf16, offset, nelem);
+    for (int j = 2; j < nranks; ++j) {
+      rankDest = ringRanks[nranks - j];
+      offset = dataOffset + rankDest * count;
+      prims.recvReduceSendBf16Input(inputBf16, offset, nelem);
+    }
+    rankDest = ringRanks[0];
+    offset = dataOffset + rankDest * count;
+    prims.recvReduceCopyBf16Input(inputBf16, offset, outputBf16, dataOffset, nelem);
+  }
+}
 } // namespace
 
 template <typename T, typename RedOp>
 struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     using Proto = ProtoSimple<REDUCESCATTER_CHUNKSTEPS / REDUCESCATTER_SLICESTEPS, REDUCESCATTER_SLICESTEPS>;
+    if constexpr (std::is_same<T, float>::value && std::is_same<RedOp, FuncSum<float>>::value) {
+      if (work->accBf16) return runRingBf16Acc<Proto>(tid, nthreads, work);
+    }
     runRing<T, RedOp, Proto>(tid, nthreads, work);
   }
 };

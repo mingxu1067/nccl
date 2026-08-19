@@ -292,6 +292,10 @@ struct alignas(16) ncclDevWorkColl {
   uint8_t pad1[12];  // pad to 16-byte boundary (20 bytes above -> 32)
   void* recvbuff;
   void* sendbuff;
+  void* accScratch;
+  size_t accCount;
+  uint8_t accBf16;
+  uint8_t padAcc[7];
   uint64_t pad0;     // pad to 16-byte boundary (16 bytes above -> 32)
   uintptr_t sendbuffOffset;
   uintptr_t recvbuffOffset;

@@ -38,6 +38,11 @@ struct ncclInfo {
   // WaitSignal descriptors
   int nDesc;
   ncclWaitSignalDesc_t* signalDescs;
+  // Experimental fused BF16-I/O / FP32-Ring-Simple accumulation metadata.
+  void* accScratch;
+  size_t accScratchBytes;
+  size_t accCount;
+  uint8_t accBf16;
 };
 
 #endif

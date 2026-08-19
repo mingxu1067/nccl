@@ -8,6 +8,7 @@
 #include "argcheck.h" // Need some checks here since we access comm
 #include "collectives.h"
 #include "enqueue.h"
+#include "group.h"
 #include "nccl.h"
 #include "nvtx_payload_schemas.h"
 
@@ -177,6 +178,22 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count, n
   return ncclEnqueueCheck(&info);
 }
 
+NCCL_API(ncclResult_t, ncclAllReduceAcc, const void* sendbuff, void* recvbuff, void* scratchbuff,
+         size_t scratchbytes, size_t count, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
+ncclResult_t ncclAllReduceAcc(const void* sendbuff, void* recvbuff, void* scratchbuff, size_t scratchbytes,
+                               size_t count, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream) {
+  if (sendbuff == nullptr || recvbuff == nullptr || comm == nullptr || op != ncclSum)
+    return ncclInvalidArgument;
+  if (ncclGroupEnabled() || count % comm->nRanks != 0) return ncclInvalidUsage;
+  const size_t shardCount = count / comm->nRanks;
+  void* shard = static_cast<char*>(recvbuff) + comm->rank * shardCount * sizeof(uint16_t);
+  ncclResult_t ret = ncclReduceScatterAcc(sendbuff, shard, scratchbuff, scratchbytes, shardCount, ncclSum, comm, stream);
+  if (ret != ncclSuccess) return ret;
+  // Keep the phase boundary explicit: the BF16 AllGather is launched after
+  // the fused FP32 ReduceScatter on the same CUDA stream.
+  return ncclAllGather(shard, recvbuff, shardCount, ncclBfloat16, comm, stream);
+}
+
 NCCL_API(ncclResult_t, ncclBroadcast, const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
          int root, ncclComm_t comm, cudaStream_t stream);
 ncclResult_t ncclBroadcast(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype, int root,
@@ -252,6 +269,21 @@ ncclResult_t ncclReduceScatter(const void* sendbuff, void* recvbuff, size_t recv
                           stream, /* Args */
                           REDUCESCATTER_CHUNKSTEPS,
                           REDUCESCATTER_SLICESTEPS};
+  return ncclEnqueueCheck(&info);
+}
+
+NCCL_API(ncclResult_t, ncclReduceScatterAcc, const void* sendbuff, void* recvbuff, void* scratchbuff,
+         size_t scratchbytes, size_t recvcount, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
+ncclResult_t ncclReduceScatterAcc(const void* sendbuff, void* recvbuff, void* scratchbuff, size_t scratchbytes,
+                                   size_t recvcount, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream) {
+  if (sendbuff == nullptr || recvbuff == nullptr || comm == nullptr || op != ncclSum)
+    return ncclInvalidArgument;
+  struct ncclInfo info = {ncclFuncReduceScatter, "ReduceScatterAcc", sendbuff, recvbuff, recvcount, ncclFloat32,
+                          ncclSum, 0, comm, stream, REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS};
+  info.accScratch = scratchbuff;
+  info.accScratchBytes = scratchbytes;
+  info.accCount = 0;
+  info.accBf16 = 1;
   return ncclEnqueueCheck(&info);
 }
 

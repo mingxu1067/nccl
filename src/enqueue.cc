@@ -319,6 +319,9 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
 
     devWork.sendbuff = (void*)task->sendbuff;
     devWork.recvbuff = (void*)task->recvbuff;
+    devWork.accScratch = task->accScratch;
+    devWork.accCount = task->accCount;
+    devWork.accBf16 = task->accBf16;
     devWork.sendbuffOffset = task->sendbuffOffset;
     devWork.recvbuffOffset = task->recvbuffOffset;
     devWork.sendbuffRmtAddrs = task->sendbuffRmtAddrs;
@@ -439,6 +442,13 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
       }
 
       NCCLCHECK(ncclGetAlgoInfo(comm, &agg, collNetSupport, nvlsSupport, nTasksPerChannel, simInfo));
+      // The experimental mixed BF16-I/O / FP32-transport kernels are provided
+      // only for the Ring + Simple device path.
+      if (agg.accBf16) {
+        agg.algorithm = NCCL_ALGO_RING;
+        agg.protocol = NCCL_PROTO_SIMPLE;
+        agg.nWarps = comm->maxThreads[NCCL_ALGO_RING][NCCL_PROTO_SIMPLE] / WARP_SIZE;
+      }
       agg.devFuncId = ncclDevFuncId(agg.func, agg.opDev.op, agg.datatype, agg.algorithm, agg.protocol);
 
       int isCollnet = 0, isNvls = 0;
@@ -509,6 +519,9 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
       struct ncclDevWorkColl devWork = {};
       devWork.sendbuff = (void*)task->sendbuff;
       devWork.recvbuff = (void*)task->recvbuff;
+      devWork.accScratch = task->accScratch;
+      devWork.accCount = task->accCount;
+      devWork.accBf16 = task->accBf16;
       devWork.sendbuffOffset = task->sendbuffOffset;
       devWork.recvbuffOffset = task->recvbuffOffset;
       devWork.sendbuffRmtAddrs = task->sendbuffRmtAddrs;
@@ -2726,6 +2739,10 @@ static ncclResult_t collTaskAppend(struct ncclComm* comm, struct ncclInfo* info,
     t->func = info->coll;
     t->sendbuff = info->sendbuff;
     t->recvbuff = info->recvbuff;
+    t->accScratch = info->accScratch;
+    t->accScratchBytes = info->accScratchBytes;
+    t->accCount = info->accCount;
+    t->accBf16 = info->accBf16;
     t->count = info->count;
     t->root = info->root;
     t->datatype = info->datatype;
@@ -2778,6 +2795,10 @@ static ncclResult_t ceCollTaskAppend(struct ncclComm* comm, struct ncclInfo* inf
   t->func = info->coll;
   t->sendbuff = info->sendbuff;
   t->recvbuff = info->recvbuff;
+  t->accScratch = info->accScratch;
+  t->accScratchBytes = info->accScratchBytes;
+  t->accCount = info->accCount;
+  t->accBf16 = info->accBf16;
   t->count = info->count;
   t->root = info->root;
   t->datatype = info->datatype;

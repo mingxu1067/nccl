@@ -301,6 +301,98 @@ class Primitives<T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice,
     }
   }
 
+  // Heterogeneous Ring/Simple path used by BF16-I/O / FP32-accumulation
+  // collectives.  User input is loaded as BF16 and converted in registers;
+  // the connection FIFO is still T=float, as are all reductions.  This avoids
+  // materializing a full FP32 copy of the user input in global memory.
+  template <int Recv, int Send, bool Bf16Output>
+  __device__ __forceinline__ void genericOpBf16Input(const __nv_bfloat16* input, intptr_t srcIx, void* output,
+                                                     intptr_t dstIx, int nelem) {
+    nelem = nelem < 0 ? 0 : nelem;
+    int sliceSize = stepSize * StepPerSlice;
+    sliceSize = max(divUp(nelem, 16 * SlicePerChunk) * 16, sliceSize / 32);
+    int slice = 0;
+    int offset = 0;
+
+    if (tid < nworkers && offset < nelem && !isNetOffload) {
+      NVCC_PRAGMA_UNROLL_DISABLED
+      do {
+        sliceSize = sliceSize < nelem - offset ? sliceSize : nelem - offset;
+        if (tid == 0) {
+          ncclShmem.groups[group].srcs[0] = (void*)(input + srcIx + offset);
+          if (Bf16Output) ncclShmem.groups[group].dsts[0] = (char*)output + (dstIx + offset) * sizeof(__nv_bfloat16);
+        }
+        // Source slot 0 is the local BF16 operand.  waitPeer places the
+        // received FP32 FIFO payload at source slot 1 and the outgoing FIFO
+        // at destination slot 0.
+        waitPeer<0, 0, Recv, Send, 1, Bf16Output ? 1 : 0>(srcIx, dstIx, offset, sliceSize);
+        subBarrier();
+        int workSize = ncclShmem.aborted ? 0 : sliceSize;
+        if (tid < nworkers) {
+          const __nv_bfloat16* local = (const __nv_bfloat16*)ncclShmem.groups[group].srcs[0];
+          const float* remote = Recv ? (const float*)ncclShmem.groups[group].srcs[1] : nullptr;
+          float* outFp32 = Bf16Output ? nullptr : (float*)ncclShmem.groups[group].dsts[0];
+          __nv_bfloat16* outBf16 = Bf16Output ? (__nv_bfloat16*)ncclShmem.groups[group].dsts[0] : nullptr;
+          reduceCopyBf16Local<Recv, Bf16Output>(tid, nworkers, local, remote, outFp32, outBf16, workSize);
+          /*int i = 8 * tid;
+          for (; i + 7 < workSize; i += 8 * nworkers) {
+            const __nv_bfloat162* in = reinterpret_cast<const __nv_bfloat162*>(local + i);
+            float2 a = __bfloat1622float2(in[0]);
+            float2 b = __bfloat1622float2(in[1]);
+            float2 c = __bfloat1622float2(in[2]);
+            float2 d = __bfloat1622float2(in[3]);
+            if (Recv) {
+              const float4 r0 = reinterpret_cast<const float4*>(remote + i)[0];
+              const float4 r1 = reinterpret_cast<const float4*>(remote + i)[1];
+              a.x += r0.x; a.y += r0.y; b.x += r0.z; b.y += r0.w;
+              c.x += r1.x; c.y += r1.y; d.x += r1.z; d.y += r1.w;
+            }
+            if (Bf16Output) {
+              __nv_bfloat162* out = reinterpret_cast<__nv_bfloat162*>(outBf16 + i);
+              out[0] = __floats2bfloat162_rn(a.x, a.y);
+              out[1] = __floats2bfloat162_rn(b.x, b.y);
+              out[2] = __floats2bfloat162_rn(c.x, c.y);
+              out[3] = __floats2bfloat162_rn(d.x, d.y);
+            } else {
+              float4* out = reinterpret_cast<float4*>(outFp32 + i);
+              out[0] = make_float4(a.x, a.y, b.x, b.y);
+              out[1] = make_float4(c.x, c.y, d.x, d.y);
+            }
+          }
+          for (; i + 1 < workSize; i += 2 * nworkers) {
+            float2 v = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(local + i)[0]);
+            if (Recv) {
+              const float2 r = reinterpret_cast<const float2*>(remote + i)[0];
+              v.x += r.x;
+              v.y += r.y;
+            }
+            if (Bf16Output) reinterpret_cast<__nv_bfloat162*>(outBf16 + i)[0] = __floats2bfloat162_rn(v.x, v.y);
+            else reinterpret_cast<float2*>(outFp32 + i)[0] = v;
+          }
+          if (i < workSize) {
+            float v = __bfloat162float(local[i]);
+            if (Recv) v += remote[i];
+            if (Bf16Output) outBf16[i] = __float2bfloat16(v);
+            else outFp32[i] = v;
+          }*/
+        }
+        barrier();
+        postPeer<Recv, Send>(0 < workSize);
+        offset += sliceSize;
+        slice += 1;
+      } while (slice < SlicePerChunk && offset < nelem);
+    }
+    NVCC_PRAGMA_UNROLL_DISABLED
+    while (slice < SlicePerChunk) {
+      sliceSize = sliceSize < nelem - offset ? sliceSize : nelem - offset;
+      waitPeer<0, 0, Recv, Send, 1, Bf16Output ? 1 : 0>(0, 0, 0, sliceSize);
+      barrier();
+      postPeer<Recv, Send>(0 < sliceSize);
+      offset += sliceSize;
+      slice += 1;
+    }
+  }
+
 public:
   static inline __device__ void sendPeerNotify(int peer, int connIndex, int steps) {
     ncclDevChannelPeer* peerPtr = ncclShmem.channel.peers[peer];
@@ -855,6 +947,9 @@ public:
   __device__ __forceinline__ void send(intptr_t inpIx, int eltN) {
     genericOp<0, 0, 0, 1, Input, -1>(inpIx, -1, eltN, false);
   }
+  __device__ __forceinline__ void sendBf16Input(const __nv_bfloat16* input, intptr_t inpIx, int eltN) {
+    genericOpBf16Input<0, 1, false>(input, inpIx, nullptr, -1, eltN);
+  }
   __device__ __forceinline__ void sendFromOutput(intptr_t outIx, int eltN) {
     genericOp<0, 0, 0, 1, Output, -1>(outIx, -1, eltN, false);
   }
@@ -908,12 +1003,19 @@ public:
   __device__ __forceinline__ void recvReduceCopy(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp = false) {
     genericOp<0, 0, 1, 0, Input, Output>(inpIx, outIx, eltN, postOp);
   }
+  __device__ __forceinline__ void recvReduceCopyBf16Input(const __nv_bfloat16* input, intptr_t inpIx,
+                                                          __nv_bfloat16* output, intptr_t outIx, int eltN) {
+    genericOpBf16Input<1, 0, true>(input, inpIx, output, outIx, eltN);
+  }
   __device__ __forceinline__ void directRecvReduceCopy(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp = false) {
     genericOp<1, 0, 1, 0, Input, Output>(inpIx, outIx, eltN, postOp);
   }
 
   __device__ __forceinline__ void recvReduceSend(intptr_t inpIx, int eltN, bool postOp = false) {
     genericOp<0, 0, 1, 1, Input, -1>(inpIx, -1, eltN, postOp);
+  }
+  __device__ __forceinline__ void recvReduceSendBf16Input(const __nv_bfloat16* input, intptr_t inpIx, int eltN) {
+    genericOpBf16Input<1, 1, false>(input, inpIx, nullptr, -1, eltN);
   }
   __device__ __forceinline__ void directRecvReduceSend(intptr_t inpIx, int eltN, bool postOp = false) {
     genericOp<1, 0, 1, 1, Input, -1>(inpIx, -1, eltN, postOp);

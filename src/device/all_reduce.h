@@ -82,6 +82,7 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
   }
 }
 
+
 template <typename T, typename RedOp, typename Proto>
 __device__ __forceinline__ void runTreeUpDown(int tid, int nthreads, struct ncclDevWorkColl* work) {
   ncclTree* tree = &ncclShmem.channel.tree;

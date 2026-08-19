@@ -195,6 +195,10 @@ struct ncclTaskColl {
   ncclFunc_t func;
   void const* sendbuff;
   void* recvbuff;
+  void* accScratch;
+  size_t accScratchBytes;
+  size_t accCount;
+  uint8_t accBf16;
   size_t count;
   int root;
   ncclDataType_t datatype;
