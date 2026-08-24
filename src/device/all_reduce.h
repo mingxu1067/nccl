@@ -82,6 +82,77 @@ __device__ __forceinline__ void runRing(int tid, int nthreads, struct ncclDevWor
   }
 }
 
+// BF16 user I/O with FP32 Ring ReduceScatter followed immediately by BF16
+// Ring AllGather.  Both phases execute in this collective CTA; only the
+// completed owner shard and the AllGather payload are BF16.
+template <typename Proto>
+__device__ __forceinline__ void runRingBf16Acc(int tid, int nthreads, struct ncclDevWorkColl* work) {
+  ncclRing* ring = &ncclShmem.channel.ring;
+  int const* ringRanks = ring->userRanks;
+  int ringIx = ring->index;
+  int const nranks = ncclShmem.comm.nRanks;
+  ssize_t gridOffset, channelCount, chunkCount;
+  ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(float), (ssize_t*)nullptr, &gridOffset,
+                  &channelCount, &chunkCount);
+  ssize_t const loopCount = nranks * chunkCount;
+  auto modRanks = [&] __device__(int r) -> int { return r - (r >= nranks ? nranks : 0); };
+  auto* input = static_cast<__nv_bfloat16 const*>(work->sendbuff);
+  auto* output = static_cast<__nv_bfloat16*>(work->recvbuff);
+
+  for (ssize_t elemOffset = 0; elemOffset < channelCount; elemOffset += loopCount) {
+    ssize_t remCount = channelCount - elemOffset;
+    if (remCount < loopCount) chunkCount = alignUp(divUp(remCount, nranks), 16 / sizeof(float));
+
+    // The float primitive owns the RS FIFO steps.  Its destructor publishes
+    // those steps before the BF16 primitive begins AllGather on the same links.
+    {
+      Primitives<float, FuncSum<float>, FanSymmetric<1>, 0, Proto, 0> prims(
+          tid, nthreads, &ring->prev, &ring->next, nullptr, nullptr, work->redOpArg);
+      int chunk = modRanks(ringIx + nranks - 1);
+      ssize_t chunkOffset = chunk * chunkCount;
+      ssize_t offset = gridOffset + elemOffset + chunkOffset;
+      int nelem = (int)min(chunkCount, remCount - chunkOffset);
+      prims.sendBf16Input(input, offset, nelem);
+      for (int j = 2; j < nranks; ++j) {
+        chunk = modRanks(ringIx + nranks - j);
+        chunkOffset = chunk * chunkCount;
+        offset = gridOffset + elemOffset + chunkOffset;
+        nelem = (int)min(chunkCount, remCount - chunkOffset);
+        prims.recvReduceSendBf16Input(input, offset, nelem);
+      }
+      chunk = ringIx;
+      chunkOffset = chunk * chunkCount;
+      offset = gridOffset + elemOffset + chunkOffset;
+      nelem = (int)min(chunkCount, remCount - chunkOffset);
+      prims.recvReduceCopyBf16Input(input, offset, output, offset, nelem);
+    }
+
+    // AllGather is the native BF16 Ring sequence, using the just-completed
+    // BF16 shards in output as both its input and destination.
+    {
+      Primitives<__nv_bfloat16, FuncSum<__nv_bfloat16>, FanSymmetric<1>, 1, Proto, 0> prims(
+          tid, nthreads, &ring->prev, &ring->next, output, output, work->redOpArg, 0, 0, 0, work);
+      int chunk = ringRanks[0];
+      ssize_t chunkOffset = chunk * chunkCount;
+      ssize_t offset = gridOffset + elemOffset + chunkOffset;
+      int nelem = (int)min(chunkCount, remCount - chunkOffset);
+      prims.directSend(offset, offset, nelem);
+      for (int j = 1; j < nranks - 1; ++j) {
+        chunk = ringRanks[nranks - j];
+        chunkOffset = chunk * chunkCount;
+        offset = gridOffset + elemOffset + chunkOffset;
+        nelem = (int)min(chunkCount, remCount - chunkOffset);
+        prims.directRecvCopyDirectSend(offset, offset, nelem);
+      }
+      chunk = ringRanks[1];
+      chunkOffset = chunk * chunkCount;
+      offset = gridOffset + elemOffset + chunkOffset;
+      nelem = (int)min(chunkCount, remCount - chunkOffset);
+      prims.directRecv(offset, nelem);
+    }
+  }
+}
+
 
 template <typename T, typename RedOp, typename Proto>
 __device__ __forceinline__ void runTreeUpDown(int tid, int nthreads, struct ncclDevWorkColl* work) {
@@ -230,6 +301,9 @@ template <typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     using Proto = ProtoSimple<ALLREDUCE_CHUNKSTEPS / ALLREDUCE_SLICESTEPS, ALLREDUCE_SLICESTEPS>;
+    if constexpr (std::is_same<T, float>::value && std::is_same<RedOp, FuncSum<float>>::value) {
+      if (work->accBf16) return runRingBf16Acc<Proto>(tid, nthreads, work);
+    }
     runRing<T, RedOp, Proto>(tid, nthreads, work);
   }
 };

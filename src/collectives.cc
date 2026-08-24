@@ -184,14 +184,13 @@ ncclResult_t ncclAllReduceAcc(const void* sendbuff, void* recvbuff, void* scratc
                                size_t count, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream) {
   if (sendbuff == nullptr || recvbuff == nullptr || comm == nullptr || op != ncclSum)
     return ncclInvalidArgument;
-  if (ncclGroupEnabled() || count % comm->nRanks != 0) return ncclInvalidUsage;
-  const size_t shardCount = count / comm->nRanks;
-  void* shard = static_cast<char*>(recvbuff) + comm->rank * shardCount * sizeof(uint16_t);
-  ncclResult_t ret = ncclReduceScatterAcc(sendbuff, shard, scratchbuff, scratchbytes, shardCount, ncclSum, comm, stream);
-  if (ret != ncclSuccess) return ret;
-  // Keep the phase boundary explicit: the BF16 AllGather is launched after
-  // the fused FP32 ReduceScatter on the same CUDA stream.
-  return ncclAllGather(shard, recvbuff, shardCount, ncclBfloat16, comm, stream);
+  struct ncclInfo info = {ncclFuncAllReduce, "AllReduceAcc", sendbuff, recvbuff, count, ncclFloat32,
+                          ncclSum, 0, comm, stream, ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS};
+  info.accScratch = scratchbuff;
+  info.accScratchBytes = scratchbytes;
+  info.accCount = 0;
+  info.accBf16 = 1;
+  return ncclEnqueueCheck(&info);
 }
 
 NCCL_API(ncclResult_t, ncclBroadcast, const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
