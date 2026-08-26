@@ -94,8 +94,8 @@ struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_S
     using Proto = ProtoSimple<REDUCESCATTER_CHUNKSTEPS / REDUCESCATTER_SLICESTEPS, REDUCESCATTER_SLICESTEPS>;
     if constexpr (std::is_same<T, float>::value && std::is_same<RedOp, FuncSum<float>>::value) {
       // The preceding P2P batch already produced the final BF16 owner shard.
-      if (work->a2aFused) return;
-      if (work->accBf16) return runRingBf16Acc<Proto>(tid, nthreads, work);
+      if (work->a2aMP) return;
+      if (work->mixedPrecision) return runRingBf16Acc<Proto>(tid, nthreads, work);
     }
     runRing<T, RedOp, Proto>(tid, nthreads, work);
   }

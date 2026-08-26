@@ -168,10 +168,10 @@ __device__ inline int checkAbort(int& abortCache, const int abortValue, int& spi
 #include "prims_ll128.h"
 
 template <int NPeers, bool FirstWindow, bool LastWindow>
-__device__ __forceinline__ void ncclA2aFusedAccumulatePtrs(int tid, int nthreads, const __nv_bfloat16* local,
+__device__ __forceinline__ void ncclA2aMPAccumulatePtrs(int tid, int nthreads, const __nv_bfloat16* local,
                                                            void* const* remotes, float* accum,
                                                            __nv_bfloat16* output, int nelem) {
-  static_assert(0 < NPeers && NPeers <= NCCL_MAX_DIRECT_ARITY, "Unsupported A2AFused peer count");
+  static_assert(0 < NPeers && NPeers <= NCCL_MAX_DIRECT_ARITY, "Unsupported A2AMP peer count");
   union alignas(16) Bf16Pack8 { BytePack<16> bytes; __nv_bfloat162 b[4]; };
   union alignas(16) FloatPack4 { BytePack<16> bytes; float f[4]; };
   // Two packed loads give the best measured balance between instruction-level
@@ -248,9 +248,9 @@ __device__ __forceinline__ void ncclA2aFusedAccumulatePtrs(int tid, int nthreads
 }
 
 template <int NPeers>
-__device__ __forceinline__ void ncclA2aFusedReducePtrs(int tid, int nthreads, const __nv_bfloat16* local,
+__device__ __forceinline__ void ncclA2aMPReducePtrs(int tid, int nthreads, const __nv_bfloat16* local,
                                                        void* const* remotes, __nv_bfloat16* output, int nelem) {
-  ncclA2aFusedAccumulatePtrs<NPeers, true, true>(tid, nthreads, local, remotes, nullptr, output, nelem);
+  ncclA2aMPAccumulatePtrs<NPeers, true, true>(tid, nthreads, local, remotes, nullptr, output, nelem);
 }
 
 #endif

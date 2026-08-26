@@ -256,7 +256,7 @@ struct alignas(16) ncclDevWorkP2p {
   uint8_t sendNetReg:1, recvNetReg:1;
   uint8_t sendIpcReg:1, recvIpcReg:1;
   uint8_t profilerEnabled:1;
-  uint8_t a2aFused:1;
+  uint8_t a2aMP:1;
 };
 
 // Compute the subset of the data transfer corresponding to the given part index.
@@ -297,8 +297,8 @@ struct alignas(16) ncclDevWorkColl {
   void* sendbuff;
   void* accScratch;
   size_t accCount;
-  uint8_t accBf16;
-  uint8_t a2aFused;
+  uint8_t mixedPrecision;
+  uint8_t a2aMP;
   uint8_t padAcc[6];
   uint64_t pad0;     // pad to 16-byte boundary (16 bytes above -> 32)
   uintptr_t sendbuffOffset;
@@ -397,8 +397,8 @@ __host__ __device__ constexpr int ncclMaxDevWorkBatchBytes(int cudaArch = NCCL_C
 #define NCCL_MAX_DEV_WORK_BATCH_BYTES 1024
 #define NCCL_MAX_DEV_WORK_BATCH_COLLS (NCCL_MAX_DEV_WORK_BATCH_BYTES / sizeof(ncclDevWorkColl))
 #define NCCL_MAX_DEV_WORK_P2P_PER_BATCH 8
-#define NCCL_MAX_DEV_WORK_P2P_A2A_FUSED 127
-#define NCCL_MAX_RANKS_A2A_FUSED (NCCL_MAX_DEV_WORK_P2P_A2A_FUSED + 1)
+#define NCCL_MAX_DEV_WORK_P2P_A2A_MP 127
+#define NCCL_MAX_RANKS_A2A_MP (NCCL_MAX_DEV_WORK_P2P_A2A_MP + 1)
 struct alignas(16) ncclDevWorkBatch {
   union {
     struct {

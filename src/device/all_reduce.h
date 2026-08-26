@@ -154,7 +154,7 @@ __device__ __forceinline__ void runRingBf16Acc(int tid, int nthreads, struct ncc
 }
 
 template <typename Proto>
-__device__ __forceinline__ void runA2aFused(int tid, int nthreads, ncclDevWorkColl* work) {
+__device__ __forceinline__ void runA2aMP(int tid, int nthreads, ncclDevWorkColl* work) {
   // The preceding P2P batch and this AllGather execute on the same CTA and
   // channel. Reuse the P2P partition exactly so every CTA consumes only its
   // own completed owner tile; the ring FIFO handshake provides inter-rank
@@ -339,8 +339,8 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     using Proto = ProtoSimple<ALLREDUCE_CHUNKSTEPS / ALLREDUCE_SLICESTEPS, ALLREDUCE_SLICESTEPS>;
     if constexpr (std::is_same<T, float>::value && std::is_same<RedOp, FuncSum<float>>::value) {
-      if (work->a2aFused) return runA2aFused<Proto>(tid, nthreads, work);
-      if (work->accBf16) return runRingBf16Acc<Proto>(tid, nthreads, work);
+      if (work->a2aMP) return runA2aMP<Proto>(tid, nthreads, work);
+      if (work->mixedPrecision) return runRingBf16Acc<Proto>(tid, nthreads, work);
     }
     runRing<T, RedOp, Proto>(tid, nthreads, work);
   }

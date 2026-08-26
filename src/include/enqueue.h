@@ -47,7 +47,7 @@ bool ncclTestBudget(struct ncclKernelPlanBudget* budget, int nWorkBatches, ssize
 
 void ncclAddWorkBatchToPlan(struct ncclComm* comm, struct ncclKernelPlan* plan, int channelId,
                             enum ncclDevWorkType workType, int devFuncId, uint32_t workOffset, int p2pEpoch = -1,
-                            int p2pRound = -1, bool newBatch = false, bool a2aFused = false);
+                            int p2pRound = -1, bool newBatch = false, bool a2aMP = false);
 
 ncclResult_t ncclAddProxyOpIfNeeded(struct ncclComm* comm, struct ncclKernelPlan* plan, struct ncclProxyOp* op);
 

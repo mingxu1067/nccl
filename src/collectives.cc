@@ -12,11 +12,11 @@
 #include "nccl.h"
 #include "nvtx_payload_schemas.h"
 
-static ncclResult_t ncclA2aFusedP2p(const void* sendbuff, void* recvbuff, size_t count, int peer, ncclComm_t comm,
+static ncclResult_t ncclA2aMPP2p(const void* sendbuff, void* recvbuff, size_t count, int peer, ncclComm_t comm,
                                     cudaStream_t stream) {
   const bool isSend = sendbuff != nullptr;
   ncclInfo info = {isSend ? ncclFuncSend : ncclFuncRecv,
-                   isSend ? "A2AFusedSend" : "A2AFusedRecv",
+                   isSend ? "A2AMPSend" : "A2AMPRecv",
                    nullptr,
                    isSend ? const_cast<void*>(sendbuff) : recvbuff,
                    count,
@@ -27,7 +27,7 @@ static ncclResult_t ncclA2aFusedP2p(const void* sendbuff, void* recvbuff, size_t
                    stream,
                    1,
                    1};
-  info.a2aFused = 1;
+  info.a2aMP = 1;
   return ncclEnqueueCheck(&info);
 }
 
@@ -197,24 +197,24 @@ ncclResult_t ncclAllReduce(const void* sendbuff, void* recvbuff, size_t count, n
   return ncclEnqueueCheck(&info);
 }
 
-NCCL_API(ncclResult_t, ncclAllReduceAcc, const void* sendbuff, void* recvbuff, void* scratchbuff,
+NCCL_API(ncclResult_t, ncclAllReduceRingMP, const void* sendbuff, void* recvbuff, void* scratchbuff,
          size_t scratchbytes, size_t count, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
-ncclResult_t ncclAllReduceAcc(const void* sendbuff, void* recvbuff, void* scratchbuff, size_t scratchbytes,
+ncclResult_t ncclAllReduceRingMP(const void* sendbuff, void* recvbuff, void* scratchbuff, size_t scratchbytes,
                                size_t count, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream) {
   if (sendbuff == nullptr || recvbuff == nullptr || comm == nullptr || op != ncclSum)
     return ncclInvalidArgument;
-  struct ncclInfo info = {ncclFuncAllReduce, "AllReduceAcc", sendbuff, recvbuff, count, ncclFloat32,
+  struct ncclInfo info = {ncclFuncAllReduce, "AllReduceRingMP", sendbuff, recvbuff, count, ncclFloat32,
                           ncclSum, 0, comm, stream, ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS};
   info.accScratch = scratchbuff;
   info.accScratchBytes = scratchbytes;
   info.accCount = 0;
-  info.accBf16 = 1;
+  info.mixedPrecision = 1;
   return ncclEnqueueCheck(&info);
 }
 
-NCCL_API(ncclResult_t, ncclAllReduceAccA2AFused, const void* sendbuff, void* recvbuff, void* scratchbuff,
+NCCL_API(ncclResult_t, ncclAllReduceA2AMP, const void* sendbuff, void* recvbuff, void* scratchbuff,
          size_t scratchbytes, size_t count, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
-ncclResult_t ncclAllReduceAccA2AFused(const void* sendbuff, void* recvbuff, void* scratchbuff, size_t scratchbytes,
+ncclResult_t ncclAllReduceA2AMP(const void* sendbuff, void* recvbuff, void* scratchbuff, size_t scratchbytes,
                                      size_t count, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream) {
   if (sendbuff == nullptr || recvbuff == nullptr || scratchbuff == nullptr || comm == nullptr || op != ncclSum ||
       count % comm->nRanks != 0 || scratchbytes < count * sizeof(uint16_t))
@@ -225,19 +225,19 @@ ncclResult_t ncclAllReduceAccA2AFused(const void* sendbuff, void* recvbuff, void
   NCCLCHECK(ncclGroupStart());
   for (int peer = 0; peer < comm->nRanks; peer++) {
     if (peer == comm->rank) continue;
-    NCCLCHECK(ncclA2aFusedP2p(static_cast<const uint16_t*>(sendbuff) + size_t(peer) * recvcount, nullptr, recvcount,
+    NCCLCHECK(ncclA2aMPP2p(static_cast<const uint16_t*>(sendbuff) + size_t(peer) * recvcount, nullptr, recvcount,
                               peer, comm, stream));
-    NCCLCHECK(ncclA2aFusedP2p(nullptr, static_cast<uint16_t*>(scratchbuff) + size_t(peer) * recvcount, recvcount, peer,
+    NCCLCHECK(ncclA2aMPP2p(nullptr, static_cast<uint16_t*>(scratchbuff) + size_t(peer) * recvcount, recvcount, peer,
                               comm, stream));
   }
 
-  ncclInfo info = {ncclFuncAllReduce,    "AllReduceAccA2AFused", sendbuff, recvbuff, count,
+  ncclInfo info = {ncclFuncAllReduce,    "AllReduceA2AMP", sendbuff, recvbuff, count,
                    ncclFloat32,          ncclSum,                 0,        comm,     stream,
                    ALLREDUCE_CHUNKSTEPS, ALLREDUCE_SLICESTEPS};
   info.accScratch = scratchbuff;
   info.accScratchBytes = scratchbytes;
-  info.accBf16 = 1;
-  info.a2aFused = 1;
+  info.mixedPrecision = 1;
+  info.a2aMP = 1;
   NCCLCHECK(ncclEnqueueCheck(&info));
   return ncclGroupEnd();
 }
@@ -320,24 +320,24 @@ ncclResult_t ncclReduceScatter(const void* sendbuff, void* recvbuff, size_t recv
   return ncclEnqueueCheck(&info);
 }
 
-NCCL_API(ncclResult_t, ncclReduceScatterAcc, const void* sendbuff, void* recvbuff, void* scratchbuff,
+NCCL_API(ncclResult_t, ncclReduceScatterRingMP, const void* sendbuff, void* recvbuff, void* scratchbuff,
          size_t scratchbytes, size_t recvcount, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
-ncclResult_t ncclReduceScatterAcc(const void* sendbuff, void* recvbuff, void* scratchbuff, size_t scratchbytes,
+ncclResult_t ncclReduceScatterRingMP(const void* sendbuff, void* recvbuff, void* scratchbuff, size_t scratchbytes,
                                    size_t recvcount, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream) {
   if (sendbuff == nullptr || recvbuff == nullptr || comm == nullptr || op != ncclSum)
     return ncclInvalidArgument;
-  struct ncclInfo info = {ncclFuncReduceScatter, "ReduceScatterAcc", sendbuff, recvbuff, recvcount, ncclFloat32,
+  struct ncclInfo info = {ncclFuncReduceScatter, "ReduceScatterRingMP", sendbuff, recvbuff, recvcount, ncclFloat32,
                           ncclSum, 0, comm, stream, REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS};
   info.accScratch = scratchbuff;
   info.accScratchBytes = scratchbytes;
   info.accCount = 0;
-  info.accBf16 = 1;
+  info.mixedPrecision = 1;
   return ncclEnqueueCheck(&info);
 }
 
-NCCL_API(ncclResult_t, ncclReduceScatterAccA2AFused, const void* sendbuff, void* recvbuff, void* scratchbuff,
+NCCL_API(ncclResult_t, ncclReduceScatterA2AMP, const void* sendbuff, void* recvbuff, void* scratchbuff,
          size_t scratchbytes, size_t recvcount, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
-ncclResult_t ncclReduceScatterAccA2AFused(const void* sendbuff, void* recvbuff, void* scratchbuff,
+ncclResult_t ncclReduceScatterA2AMP(const void* sendbuff, void* recvbuff, void* scratchbuff,
                                          size_t scratchbytes, size_t recvcount, ncclRedOp_t op, ncclComm_t comm,
                                          cudaStream_t stream) {
   if (sendbuff == nullptr || recvbuff == nullptr || scratchbuff == nullptr || comm == nullptr || op != ncclSum ||
@@ -348,19 +348,19 @@ ncclResult_t ncclReduceScatterAccA2AFused(const void* sendbuff, void* recvbuff, 
   NCCLCHECK(ncclGroupStart());
   for (int peer = 0; peer < comm->nRanks; peer++) {
     if (peer == comm->rank) continue;
-    NCCLCHECK(ncclA2aFusedP2p(static_cast<const uint16_t*>(sendbuff) + size_t(peer) * recvcount, nullptr, recvcount,
+    NCCLCHECK(ncclA2aMPP2p(static_cast<const uint16_t*>(sendbuff) + size_t(peer) * recvcount, nullptr, recvcount,
                               peer, comm, stream));
-    NCCLCHECK(ncclA2aFusedP2p(nullptr, static_cast<uint16_t*>(scratchbuff) + size_t(peer) * recvcount, recvcount, peer,
+    NCCLCHECK(ncclA2aMPP2p(nullptr, static_cast<uint16_t*>(scratchbuff) + size_t(peer) * recvcount, recvcount, peer,
                               comm, stream));
   }
 
-  ncclInfo info = {ncclFuncReduceScatter,    "ReduceScatterAccA2AFused", sendbuff, recvbuff, recvcount,
+  ncclInfo info = {ncclFuncReduceScatter,    "ReduceScatterA2AMP", sendbuff, recvbuff, recvcount,
                    ncclFloat32,              ncclSum,                    0,        comm,     stream,
                    REDUCESCATTER_CHUNKSTEPS, REDUCESCATTER_SLICESTEPS};
   info.accScratch = scratchbuff;
   info.accScratchBytes = scratchbytes;
-  info.accBf16 = 1;
-  info.a2aFused = 1;
+  info.mixedPrecision = 1;
+  info.a2aMP = 1;
   NCCLCHECK(ncclEnqueueCheck(&info));
   return ncclGroupEnd();
 }

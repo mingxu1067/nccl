@@ -501,12 +501,12 @@ ncclResult_t pncclAllReduce(const void* sendbuff, void* recvbuff, size_t count,
 /* Experimental BF16 AllReduce: fused Ring/Simple BF16-I/O / FP32
  * ReduceScatter followed by a standard BF16 AllGather. scratchbuff and
  * scratchbytes are retained for ABI compatibility and are unused. SUM only. */
-ncclResult_t ncclAllReduceAcc(const void* sendbuff, void* recvbuff, void* scratchbuff,
+ncclResult_t ncclAllReduceRingMP(const void* sendbuff, void* recvbuff, void* scratchbuff,
     size_t scratchbytes, size_t count, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
 
 /* Experimental one-kernel BF16 A2A: transport, FP32 owner accumulation, and
  * final BF16 output execute in one NCCL device collective launch. */
-ncclResult_t ncclAllReduceAccA2AFused(const void* sendbuff, void* recvbuff, void* scratchbuff,
+ncclResult_t ncclAllReduceA2AMP(const void* sendbuff, void* recvbuff, void* scratchbuff,
     size_t scratchbytes, size_t count, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
 
 /*
@@ -531,12 +531,12 @@ ncclResult_t pncclReduceScatter(const void* sendbuff, void* recvbuff,
  * communication/accumulation. Local BF16 is converted at consumption time;
  * scratchbuff and scratchbytes are retained for ABI compatibility and unused.
  * SUM only. */
-ncclResult_t ncclReduceScatterAcc(const void* sendbuff, void* recvbuff, void* scratchbuff,
+ncclResult_t ncclReduceScatterRingMP(const void* sendbuff, void* recvbuff, void* scratchbuff,
     size_t scratchbytes, size_t recvcount, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
 
 /* Experimental one-kernel BF16 A2A: transport, FP32 owner accumulation, and
  * final BF16 output execute in one NCCL device collective launch. */
-ncclResult_t ncclReduceScatterAccA2AFused(const void* sendbuff, void* recvbuff, void* scratchbuff,
+ncclResult_t ncclReduceScatterA2AMP(const void* sendbuff, void* recvbuff, void* scratchbuff,
     size_t scratchbytes, size_t recvcount, ncclRedOp_t op, ncclComm_t comm, cudaStream_t stream);
 
 /*
