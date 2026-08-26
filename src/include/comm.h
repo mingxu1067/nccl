@@ -199,6 +199,7 @@ struct ncclTaskColl {
   size_t accScratchBytes;
   size_t accCount;
   uint8_t accBf16;
+  uint8_t a2aFused;
   size_t count;
   int root;
   ncclDataType_t datatype;
@@ -269,6 +270,7 @@ struct ncclTaskP2p {
   int root;
   size_t bytes;
   bool allowUB;
+  bool a2aFused;
 
   // Profiler plugin
   int eActivationMask;
@@ -486,7 +488,8 @@ struct ncclKernelPlanner {
         int nP2ps; // Number of p2p works in this batch
         int nBcasts; // Number of bcast works in this batch
         int p2pEpoch;
-        int p2pRounds[NCCL_MAX_DEV_WORK_P2P_PER_BATCH]; // which rounds are present in this batch.
+        // Generic P2P uses eight rounds; A2AFused can fuse 127 rounds.
+        int p2pRounds[NCCL_MAX_DEV_WORK_P2P_A2A_FUSED]; // which rounds are present in this batch.
       } wipBatch; // work-in-progress batch which will be next tail of workBatchQueue
       int nWorkBatchesP2p; // number of p2p batches for this channel.
       int nWorkBatchesBcast; // number of bcast batches for this channel.

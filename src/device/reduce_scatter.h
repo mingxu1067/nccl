@@ -85,6 +85,7 @@ __device__ __forceinline__ void runRingBf16Acc(int tid, int nthreads, struct ncc
     prims.recvReduceCopyBf16Input(inputBf16, offset, outputBf16, dataOffset, nelem);
   }
 }
+
 } // namespace
 
 template <typename T, typename RedOp>
@@ -92,6 +93,8 @@ struct RunWorkColl<ncclFuncReduceScatter, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_S
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     using Proto = ProtoSimple<REDUCESCATTER_CHUNKSTEPS / REDUCESCATTER_SLICESTEPS, REDUCESCATTER_SLICESTEPS>;
     if constexpr (std::is_same<T, float>::value && std::is_same<RedOp, FuncSum<float>>::value) {
+      // The preceding P2P batch already produced the final BF16 owner shard.
+      if (work->a2aFused) return;
       if (work->accBf16) return runRingBf16Acc<Proto>(tid, nthreads, work);
     }
     runRing<T, RedOp, Proto>(tid, nthreads, work);

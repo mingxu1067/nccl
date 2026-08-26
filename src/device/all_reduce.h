@@ -153,6 +153,43 @@ __device__ __forceinline__ void runRingBf16Acc(int tid, int nthreads, struct ncc
   }
 }
 
+template <typename Proto>
+__device__ __forceinline__ void runA2aFused(int tid, int nthreads, ncclDevWorkColl* work) {
+  // The preceding P2P batch and this AllGather execute on the same CTA and
+  // channel. Reuse the P2P partition exactly so every CTA consumes only its
+  // own completed owner tile; the ring FIFO handshake provides inter-rank
+  // readiness without a grid-wide atomic barrier.
+  const int nranks = ncclShmem.comm.nRanks;
+  const size_t total = work->cbd.countLo + (work->channelHi - work->channelLo - 1) * work->cbd.countMid +
+                       work->cbd.countHi;
+  const size_t recvcount = total / nranks;
+  auto* output = (__nv_bfloat16*)work->recvbuff;
+  if (ncclShmem.channelId < work->channelLo || ncclShmem.channelId > work->channelHi) return;
+
+  const int gatherChannels = work->channelHi - work->channelLo + 1;
+  const int channel = ncclShmem.channelId - work->channelLo;
+  size_t byteBegin, byteEnd;
+  ncclP2pPartBounds(gatherChannels, channel, recvcount * sizeof(__nv_bfloat16), &byteBegin, &byteEnd);
+  const size_t begin = byteBegin / sizeof(__nv_bfloat16);
+  const size_t end = byteEnd / sizeof(__nv_bfloat16);
+  const size_t chunk = Proto::calcBytePerStep() * Proto::SlicePerChunk / sizeof(__nv_bfloat16);
+  ncclRing* ring = &ncclShmem.channel.ring;
+  int const* ringRanks = ring->userRanks;
+  Primitives<__nv_bfloat16, FuncSum<__nv_bfloat16>, FanSymmetric<1>, 1, Proto, 0> prims(
+      tid, nthreads, &ring->prev, &ring->next, output, output, work->redOpArg, 0, 0, 0, work);
+  for (size_t offset = begin; offset < end; offset += chunk) {
+    const int nelem = (int)min(chunk, end - offset);
+    size_t dataOffset = size_t(ringRanks[0]) * recvcount + offset;
+    prims.directSend(dataOffset, dataOffset, nelem);
+    for (int step = 1; step < nranks - 1; step++) {
+      dataOffset = size_t(ringRanks[nranks - step]) * recvcount + offset;
+      prims.directRecvCopyDirectSend(dataOffset, dataOffset, nelem);
+    }
+    dataOffset = size_t(ringRanks[1]) * recvcount + offset;
+    prims.directRecv(dataOffset, nelem);
+  }
+}
+
 
 template <typename T, typename RedOp, typename Proto>
 __device__ __forceinline__ void runTreeUpDown(int tid, int nthreads, struct ncclDevWorkColl* work) {
@@ -302,6 +339,7 @@ struct RunWorkColl<ncclFuncAllReduce, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     using Proto = ProtoSimple<ALLREDUCE_CHUNKSTEPS / ALLREDUCE_SLICESTEPS, ALLREDUCE_SLICESTEPS>;
     if constexpr (std::is_same<T, float>::value && std::is_same<RedOp, FuncSum<float>>::value) {
+      if (work->a2aFused) return runA2aFused<Proto>(tid, nthreads, work);
       if (work->accBf16) return runRingBf16Acc<Proto>(tid, nthreads, work);
     }
     runRing<T, RedOp, Proto>(tid, nthreads, work);

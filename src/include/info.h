@@ -43,6 +43,7 @@ struct ncclInfo {
   size_t accScratchBytes;
   size_t accCount;
   uint8_t accBf16;
+  uint8_t a2aFused;
 };
 
 #endif

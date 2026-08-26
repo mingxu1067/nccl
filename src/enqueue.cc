@@ -120,7 +120,7 @@ NCCL_PARAM(P2pEpochEnable, "P2P_EPOCH_ENABLE", 1);
 
 void ncclAddWorkBatchToPlan(struct ncclComm* comm, struct ncclKernelPlan* plan, int channelId,
                             enum ncclDevWorkType workType, int devFuncId, uint32_t workOffset, int p2pEpoch,
-                            int p2pRound, bool newBatch) {
+                            int p2pRound, bool newBatch, bool a2aFused) {
   size_t workSize = ncclDevWorkSize(workType);
   ncclKernelPlanner::WipPlan::Channel* chan = &comm->planner.wipPlan.channels[channelId];
   // Conditions causing us to create a new blank batch.
@@ -137,23 +137,25 @@ void ncclAddWorkBatchToPlan(struct ncclComm* comm, struct ncclKernelPlan* plan, 
     // batch further down.
     if (workType == ncclDevWorkTypeP2p) {
       if (ncclParamP2pEpochEnable()) newBatch |= chan->wipBatch.p2pEpoch != p2pEpoch;
-      // We only allow NCCL_MAX_DEV_WORK_P2P_PER_BATCH ops per batch.
-      newBatch |= chan->wipBatch.nP2ps == NCCL_MAX_DEV_WORK_P2P_PER_BATCH;
+      int maxP2ps = a2aFused ? NCCL_MAX_DEV_WORK_P2P_A2A_FUSED : NCCL_MAX_DEV_WORK_P2P_PER_BATCH;
+      newBatch |= chan->wipBatch.nP2ps == maxP2ps;
       for (int i = 0; i < chan->wipBatch.nP2ps; i++) {
         // Do not allow the same round twice in the same batch, it would use the same connection.
         newBatch |= p2pRound == chan->wipBatch.p2pRounds[i];
         // Make sure we only aggregate p2p operations within the same p2p group (one group is
         // NCCL_MAX_DEV_WORK_P2P_PER_BATCH ops).
         // This enforces uniform batching accross ranks in the communicator and prevents hangs.
-        newBatch |= (p2pRound / NCCL_MAX_DEV_WORK_P2P_PER_BATCH) !=
-                    (chan->wipBatch.p2pRounds[i] / NCCL_MAX_DEV_WORK_P2P_PER_BATCH);
+        if (!a2aFused)
+          newBatch |= (p2pRound / NCCL_MAX_DEV_WORK_P2P_PER_BATCH) !=
+                      (chan->wipBatch.p2pRounds[i] / NCCL_MAX_DEV_WORK_P2P_PER_BATCH);
       }
     }
     if (workType == ncclDevWorkTypeBcast) {
       int maxitem = ncclMaxDevWorkBatchBytes(comm->cudaArch) / sizeof(ncclDevWorkBcast);
       newBatch |= chan->wipBatch.nBcasts == maxitem;
     } else {
-      newBatch |= NCCL_MAX_DEV_WORK_BATCH_BYTES < chan->wipBatch.workBytes + workSize;
+      size_t maxBatchBytes = a2aFused ? ncclMaxDevWorkBatchBytes(comm->cudaArch) : NCCL_MAX_DEV_WORK_BATCH_BYTES;
+      newBatch |= maxBatchBytes < chan->wipBatch.workBytes + workSize;
     }
   }
   // Conditions causing us to create an extension batch (prev->nextExtends=1)
@@ -322,6 +324,7 @@ ncclResult_t ncclTasksRegAndEnqueue(struct ncclComm* comm) {
     devWork.accScratch = task->accScratch;
     devWork.accCount = task->accCount;
     devWork.accBf16 = task->accBf16;
+    devWork.a2aFused = task->a2aFused;
     devWork.sendbuffOffset = task->sendbuffOffset;
     devWork.recvbuffOffset = task->recvbuffOffset;
     devWork.sendbuffRmtAddrs = task->sendbuffRmtAddrs;
@@ -522,6 +525,7 @@ ncclResult_t ncclPrepareTasks(struct ncclComm* comm, bool* algoNeedConnect, bool
       devWork.accScratch = task->accScratch;
       devWork.accCount = task->accCount;
       devWork.accBf16 = task->accBf16;
+      devWork.a2aFused = task->a2aFused;
       devWork.sendbuffOffset = task->sendbuffOffset;
       devWork.recvbuffOffset = task->recvbuffOffset;
       devWork.sendbuffRmtAddrs = task->sendbuffRmtAddrs;
@@ -624,7 +628,7 @@ static ncclResult_t scheduleCollTasksToPlan(struct ncclComm* comm, struct ncclKe
     struct ncclTaskColl* task = ncclIntruQueueHead(&planner->collTaskQueue);
     struct ncclWorkList* workNode = ncclIntruQueueHead(&planner->collWorkQueue);
     struct ncclDevWorkColl* devWork = (struct ncclDevWorkColl*)(workNode + 1);
-    size_t elementSize = ncclTypeSize(task->datatype);
+    size_t elementSize = task->a2aFused ? sizeof(uint16_t) : ncclTypeSize(task->datatype);
 
     int kind = 2 * task->isCollnet + task->isNvls;
     if (kind != kindPrev) {
@@ -879,7 +883,7 @@ NCCL_PARAM(ChunkSize, "CHUNK_SIZE", 0);
 static ncclResult_t addP2pToPlan(struct ncclComm* comm, struct ncclKernelPlan* plan, int nChannelsMin, int nChannelsMax,
                                  int p2pEpoch, int p2pRound, int sendRank, void* sendAddr, ssize_t sendBytes,
                                  int recvRank, void* recvAddr, ssize_t recvBytes, const int planTotalTasks[],
-                                 struct ncclTaskP2p** p2pTasks) {
+                                 struct ncclTaskP2p** p2pTasks, const struct ncclTaskColl* a2aTask) {
   ncclResult_t ret = ncclSuccess;
   constexpr int connIndex = 1;
   bool selfSend = (sendRank == comm->rank);
@@ -890,7 +894,9 @@ static ncclResult_t addP2pToPlan(struct ncclComm* comm, struct ncclKernelPlan* p
   bool network[2] = {false, false};
   bool proxySameProcess[2] = {true, true};
   void** handles[2] = {NULL, NULL};
-  uint8_t base = ncclP2pChannelBaseForRound(comm, p2pRound);
+  const bool a2aFused = (p2pTasks[0] != nullptr && p2pTasks[0]->a2aFused) ||
+                        (p2pTasks[1] != nullptr && p2pTasks[1]->a2aFused);
+  uint8_t base = a2aFused ? 0 : ncclP2pChannelBaseForRound(comm, p2pRound);
   struct ncclProxyOp proxyOps[2] = {};
   int nProxyOps = selfSend ? 0 : 2;
   if (!selfSend) {
@@ -926,6 +932,11 @@ static ncclResult_t addP2pToPlan(struct ncclComm* comm, struct ncclKernelPlan* p
 
     if (bytes[dir] == -1) {
       nChannels[dir] = 0;
+    } else if (a2aFused) {
+      // Every owner CTA must receive the matching range from every peer before
+      // performing its channel-local reduction. Do not let generic small-P2P
+      // sizing collapse this below the native collective's CTA count.
+      nChannels[dir] = nChannelsMax;
     } else if (bytes[dir] == 0) {
       nChannels[dir] = 1;
     } else {
@@ -943,6 +954,7 @@ static ncclResult_t addP2pToPlan(struct ncclComm* comm, struct ncclKernelPlan* p
 
     // Select protocol (LL vs SIMPLE) used based on payload per channel
     if (bytes[dir] != -1) protoLL[dir] &= bytes[dir] <= nChannels[dir] * ncclParamP2pLLThreshold();
+    if (a2aFused) protoLL[dir] = false;
     protocol[dir] = protoLL[dir] ? NCCL_PROTO_LL : NCCL_PROTO_SIMPLE;
 
     stepSize[dir] = comm->buffSizes[protocol[dir]] / NCCL_STEPS;
@@ -1018,6 +1030,15 @@ static ncclResult_t addP2pToPlan(struct ncclComm* comm, struct ncclKernelPlan* p
   struct ncclDevWorkP2p* work;
   work = (struct ncclDevWorkP2p*)(workNode + 1);
   work->nP2pChannels = comm->p2pnChannels;
+  work->a2aFused = a2aFused;
+  work->a2aInput = a2aFused ? const_cast<void*>(a2aTask->sendbuff) : nullptr;
+  work->a2aRecvcount = a2aFused ? (a2aTask->func == ncclFuncAllReduce ? a2aTask->count / comm->nRanks
+                                                                     : a2aTask->count)
+                                : 0;
+  work->a2aOutput = a2aFused ? (a2aTask->func == ncclFuncAllReduce
+                                   ? static_cast<uint16_t*>(a2aTask->recvbuff) + size_t(comm->rank) * work->a2aRecvcount
+                                   : a2aTask->recvbuff)
+                             : nullptr;
   work->channelBase = base;
   work->nSendChannels = nChannels[1];
   work->sendProtoLL = protoLL[1];
@@ -1065,7 +1086,8 @@ static ncclResult_t addP2pToPlan(struct ncclComm* comm, struct ncclKernelPlan* p
   // Each channel runs up to NCCL_MAX_DEV_WORK_P2P_PER_BATCH tasks concurrently.
   int maxConcurrent;
   int concurrentTasks[2];
-  maxConcurrent = comm->p2pnChannels / nChannelsMax * NCCL_MAX_DEV_WORK_P2P_PER_BATCH;
+  maxConcurrent = comm->p2pnChannels / nChannelsMax *
+                  (a2aFused ? NCCL_MAX_DEV_WORK_P2P_A2A_FUSED : NCCL_MAX_DEV_WORK_P2P_PER_BATCH);
   concurrentTasks[0] = std::min(planTotalTasks[0], maxConcurrent);
   concurrentTasks[1] = std::min(planTotalTasks[1], maxConcurrent);
   for (int part = 0; part < nChannelsMax; part++) {
@@ -1074,7 +1096,7 @@ static ncclResult_t addP2pToPlan(struct ncclComm* comm, struct ncclKernelPlan* p
     plan->channelMask |= uint64_t(1) << channelId;
     // Add batch first.
     ncclAddWorkBatchToPlan(comm, plan, channelId, ncclDevWorkTypeP2p, ncclDevFuncId_P2p(), workOffset, p2pEpoch,
-                           p2pRound);
+                           p2pRound, false, a2aFused);
     for (int dir = 0; dir < nProxyOps; dir++) {
       // Partition steps across channels.
       int nParts = dir ? work->nSendChannels : work->nRecvChannels;
@@ -1141,11 +1163,14 @@ static int calcP2pChannelCount(size_t totalSize, int minChannels, int maxChannel
 }
 
 static ncclResult_t scheduleP2pTasksToPlan(struct ncclComm* comm, int* p2pEpoch, int* p2pRound,
-                                           struct ncclKernelPlan* plan, struct ncclKernelPlanBudget* budget) {
+                                           struct ncclKernelPlan* plan, struct ncclKernelPlanBudget* budget,
+                                           int a2aFusedChannels = 0, int a2aFusedThreads = 0,
+                                           const struct ncclTaskColl* a2aTask = nullptr) {
   int nRanks = comm->nRanks;
   struct ncclKernelPlanner::Peer* peers = comm->planner.peers;
 
-  plan->threadPerBlock = std::max(plan->threadPerBlock, NCCL_MAX_NTHREADS);
+  plan->threadPerBlock = std::max(plan->threadPerBlock,
+                                  a2aFusedThreads != 0 ? a2aFusedThreads : NCCL_MAX_NTHREADS);
   if (!plan->kernelSpecialized) {
     plan->kernelFn = ncclDevKernelForFunc[ncclDevFuncId_P2p()];
     plan->kernelSpecialized = ncclDevKernelForFuncIsSpecialized[ncclDevFuncId_P2p()];
@@ -1157,6 +1182,7 @@ static ncclResult_t scheduleP2pTasksToPlan(struct ncclComm* comm, int* p2pEpoch,
   int nChannelsMin = nChannelsMax;
   // Try to use all channels, but one channel per operation.
   while (nChannelsMin * nRanks > comm->p2pnChannels && nChannelsMin > 1) nChannelsMin /= 2;
+  if (a2aFusedChannels != 0) nChannelsMin = nChannelsMax = a2aFusedChannels;
 
   // Save the total count of send/recv tasks in the plan
   int planTotalTasks[2] = {comm->planner.nTasksP2pRecv, comm->planner.nTasksP2pSend};
@@ -1200,7 +1226,7 @@ static ncclResult_t scheduleP2pTasksToPlan(struct ncclComm* comm, int* p2pEpoch,
         }
         struct ncclTaskP2p* p2pTasks[2] = {recv, send};
         NCCLCHECK(addP2pToPlan(comm, plan, nChannelsMin, nChannelsMax, *p2pEpoch, *p2pRound, sendRank, sendBuff,
-                               sendBytes, recvRank, recvBuff, recvBytes, planTotalTasks, p2pTasks));
+                               sendBytes, recvRank, recvBuff, recvBytes, planTotalTasks, p2pTasks, a2aTask));
         if (send != nullptr) {
           ncclIntruQueueDequeue(&peers[sendRank].sendQueue);
           // Profiler - We can overwrite groupAPI event handles here since all operations here belong to the same group
@@ -1578,6 +1604,48 @@ static ncclResult_t getImplicitOrder(enum ncclImplicitOrder* mode, bool capturin
   return ncclSuccess;
 }
 
+// Reproduce the single-task Ring/Simple channel allocation used by
+// scheduleCollTasksToPlan, but account for A2AFused's BF16 wire traffic. This
+// is needed before P2P work is scheduled so transport and owner reduction use
+// the exact same CTA set.
+static int ncclA2aFusedChannelCount(struct ncclComm* comm, const struct ncclTaskColl* task) {
+  constexpr size_t minTrafficPerChannel = 32 << 10;
+  constexpr size_t elementSize = sizeof(uint16_t);
+  if (task->count == 0) return 1;
+  const int maxChannels = std::min<int>(task->nMaxChannels, comm->nChannels);
+  int trafficPerByte = ncclFuncTrafficPerByte(task->func, comm->nRanks);
+  if (task->protocol == NCCL_PROTO_LL) trafficPerByte *= 4;
+
+  const size_t trafficBytes = std::max(minTrafficPerChannel, task->trafficBytes);
+  const size_t trafficPerChannel = divUp(trafficBytes / maxChannels, 16) * 16;
+  const size_t cellSize = divUp(divUp(minTrafficPerChannel, size_t(trafficPerByte)), 16) * 16;
+  const size_t cells = divUp(task->count * elementSize, cellSize);
+  const size_t trafficPerCell = cellSize * trafficPerByte;
+  size_t cellsPerChannel = std::min(cells, divUp(trafficPerChannel, trafficPerCell));
+  size_t cellsLo = std::min(cells, divUp(trafficPerChannel, trafficPerCell));
+  int nMidChannels = (cells - cellsLo) / cellsPerChannel;
+  size_t cellsHi = (cells - cellsLo) % cellsPerChannel;
+  if (maxChannels < 1 + nMidChannels + (cellsHi != 0)) {
+    nMidChannels = maxChannels - 2;
+    cellsPerChannel = (cells - cellsLo) / (nMidChannels + 1);
+    cellsHi = cellsPerChannel + (cells - cellsLo) % (nMidChannels + 1);
+  }
+  if (cellsHi == 0 && nMidChannels != 0) {
+    cellsHi = cellsPerChannel;
+    nMidChannels -= 1;
+  }
+  if (cellsLo == 0) {
+    if (nMidChannels == 0) {
+      cellsLo = cellsHi;
+      cellsHi = 0;
+    } else {
+      cellsLo = cellsPerChannel;
+      nMidChannels -= 1;
+    }
+  }
+  return (cellsLo != 0 ? 1 : 0) + nMidChannels + (cellsHi != 0 ? 1 : 0);
+}
+
 ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
   ncclResult_t result = ncclSuccess;
   struct ncclKernelPlanner* planner = &comm->planner;
@@ -1622,18 +1690,36 @@ ncclResult_t ncclLaunchPrepare(struct ncclComm* comm) {
           // Non-persistent kernels fill up at most half of our fifo per kernel.
           budget.outArgsBytes = plan->persistent ? (1 << 30) : comm->workFifoBytes / 2;
 
+          // A2AFused deliberately puts its native P2P A2A batches before the
+          // owner-reduction collective in the same persistent kernel. Every rank
+          // creates the same all-peer schedule, so the usual rank-divergent P2P
+          // budget concern does not apply to this experimental path.
+          ncclTaskColl* firstColl = ncclIntruQueueHead(&planner->collTaskQueue);
+          const bool a2aFusedP2pFirst = firstColl != nullptr && firstColl->a2aFused && planner->nTasksP2p != 0;
+          if (a2aFusedP2pFirst) {
+            const int channels = ncclA2aFusedChannelCount(comm, firstColl);
+            // Collective kernels reserve one additional warp beyond the
+            // algorithm's worker warps. Give the fused SendRecv kernel the
+            // same block width as native BF16 while preserving its exact CTA
+            // mask. The extra warp joins the owner receive/reduction group.
+            const int threads = (firstColl->nWarps + 1) * WARP_SIZE;
+            NCCLCHECKGOTO(
+              scheduleP2pTasksToPlan(comm, &p2pEpoch, &p2pRound, plan, &budget, channels, threads, firstColl), result,
+              failure);
+          }
+
           // Drain coll tasks first. This is essential since we partition tasks based
           // on the work budget and p2p work isn't collective. If we were to drain p2p
           // first, the place where we cut the kernel could vary by rank which would
           // cause the "shortest channel first" channel picker to have divergent results.
-          if (planner->nTasksColl != 0) {
+          if (planner->nTasksColl != 0 && (!a2aFusedP2pFirst || planner->nTasksP2p == 0)) {
             NCCLCHECKGOTO(scheduleCollTasksToPlan(comm, plan, &budget), result, failure);
           }
           if (planner->nTasksColl == 0 && planner->nTasksBcast != 0) {
             NCCLCHECKGOTO(ncclScheduleBcastTasksToPlan(comm, plan, &budget), result, failure);
           }
           // And only drain p2p tasks once colls are depleted.
-          if (planner->nTasksColl == 0 && planner->nTasksBcast == 0 && planner->nTasksP2p != 0) {
+          if (!a2aFusedP2pFirst && planner->nTasksColl == 0 && planner->nTasksBcast == 0 && planner->nTasksP2p != 0) {
             NCCLCHECKGOTO(scheduleP2pTasksToPlan(comm, &p2pEpoch, &p2pRound, plan, &budget), result, failure);
           }
         }
@@ -2653,6 +2739,7 @@ static ncclResult_t p2pTaskAppend(struct ncclComm* comm, struct ncclInfo* info, 
   p2p->root = peer;
   p2p->bytes = nBytes;
   p2p->allowUB = allowUB;
+  p2p->a2aFused = info->a2aFused;
   p2p->eActivationMask = ncclProfilerApiState.eActivationMask;
   p2p->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
   p2p->p2pApiEventHandle = ncclProfilerApiState.p2pApiEventHandle;
@@ -2670,8 +2757,9 @@ static ncclResult_t p2pTaskAppend(struct ncclComm* comm, struct ncclInfo* info, 
       while (peer != (isSendNotRecv ? comm->p2pSchedule[round].sendRank : comm->p2pSchedule[round].recvRank)) {
         round += 1;
       }
-      uint8_t base = ncclP2pChannelBaseForRound(comm, round);
-      for (int c = 0; c < comm->p2pnChannelsPerPeer; c++) {
+      uint8_t base = info->a2aFused ? 0 : ncclP2pChannelBaseForRound(comm, round);
+      const int connectChannels = info->a2aFused ? comm->p2pnChannels : comm->p2pnChannelsPerPeer;
+      for (int c = 0; c < connectChannels; c++) {
         int channelId = ncclP2pChannelForPart(comm->p2pnChannels, base, c);
         if (isSendNotRecv) {
           if (comm->channels[channelId].peers[peer]->send[1].hasSeen == 0) {
@@ -2743,10 +2831,11 @@ static ncclResult_t collTaskAppend(struct ncclComm* comm, struct ncclInfo* info,
     t->accScratchBytes = info->accScratchBytes;
     t->accCount = info->accCount;
     t->accBf16 = info->accBf16;
+    t->a2aFused = info->a2aFused;
     t->count = info->count;
     t->root = info->root;
     t->datatype = info->datatype;
-    size_t elementSize = ncclTypeSize(t->datatype);
+    size_t elementSize = t->a2aFused ? sizeof(uint16_t) : ncclTypeSize(t->datatype);
     if (t->func == ncclFuncAllGather || t->func == ncclFuncBroadcast) {
       t->count *= elementSize;
       t->datatype = ncclInt8;
@@ -2760,6 +2849,11 @@ static ncclResult_t collTaskAppend(struct ncclComm* comm, struct ncclInfo* info,
     t->eActivationMask = ncclProfilerApiState.eActivationMask;
     t->groupApiEventHandle = ncclProfilerApiState.groupApiEventHandle;
     t->collApiEventHandle = ncclProfilerApiState.collApiEventHandle;
+
+    if (t->a2aFused &&
+        (comm->nRanks > NCCL_MAX_RANKS_A2A_FUSED || comm->nNodes != 1 ||
+         size_t(comm->nRanks - 1) * sizeof(ncclDevWorkP2p) > size_t(ncclMaxDevWorkBatchBytes(comm->cudaArch))))
+      return ncclInvalidUsage;
 
     planner->nTasksColl += 1;
     ncclTaskCollSorterInsert(&planner->collSorter, t, t->trafficBytes);
@@ -2799,6 +2893,7 @@ static ncclResult_t ceCollTaskAppend(struct ncclComm* comm, struct ncclInfo* inf
   t->accScratchBytes = info->accScratchBytes;
   t->accCount = info->accCount;
   t->accBf16 = info->accBf16;
+  t->a2aFused = info->a2aFused;
   t->count = info->count;
   t->root = info->root;
   t->datatype = info->datatype;
@@ -3037,7 +3132,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
 
   if (info->coll == ncclFuncSend || info->coll == ncclFuncRecv) {
     NCCLCHECK(p2pTaskAppend(comm, info, info->coll, collAPI, (void*)info->recvbuff, info->count, info->datatype,
-                            info->root, true));
+                            info->root, !info->a2aFused));
   } else if (info->coll == ncclFuncPutSignal || info->coll == ncclFuncSignal || info->coll == ncclFuncWaitSignal) {
     NCCLCHECK(rmaTaskAppend(comm, info));
   } else {

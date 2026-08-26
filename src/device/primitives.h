@@ -166,4 +166,91 @@ __device__ inline int checkAbort(int& abortCache, const int abortValue, int& spi
 #include "prims_simple.h"
 #include "prims_ll.h"
 #include "prims_ll128.h"
+
+template <int NPeers, bool FirstWindow, bool LastWindow>
+__device__ __forceinline__ void ncclA2aFusedAccumulatePtrs(int tid, int nthreads, const __nv_bfloat16* local,
+                                                           void* const* remotes, float* accum,
+                                                           __nv_bfloat16* output, int nelem) {
+  static_assert(0 < NPeers && NPeers <= NCCL_MAX_DIRECT_ARITY, "Unsupported A2AFused peer count");
+  union alignas(16) Bf16Pack8 { BytePack<16> bytes; __nv_bfloat162 b[4]; };
+  union alignas(16) FloatPack4 { BytePack<16> bytes; float f[4]; };
+  // Two packed loads give the best measured balance between instruction-level
+  // parallelism and the length of each thread's FP32 dependency chain.
+  constexpr int ElementsPerThread = 16;
+  constexpr int PacksPerThread = ElementsPerThread / 8;
+  const int nPacks = nelem / ElementsPerThread;
+  for (int i = tid; i < nPacks; i += nthreads) {
+    float2 sum[ElementsPerThread / 2];
+    if (FirstWindow) {
+      #pragma unroll
+      for (int pack = 0; pack < PacksPerThread; pack++) {
+        Bf16Pack8 value;
+        value.bytes = ld_global<16>(cvta_to_global(local) + 16 * (PacksPerThread * i + pack));
+        #pragma unroll
+        for (int pair = 0; pair < 4; pair++) sum[4 * pack + pair] = __bfloat1622float2(value.b[pair]);
+      }
+    } else {
+      #pragma unroll
+      for (int pack = 0; pack < ElementsPerThread / 4; pack++) {
+        FloatPack4 value;
+        value.bytes = ld_global<16>(cvta_to_global(accum) + 16 * (4 * i + pack));
+        sum[2 * pack + 0] = make_float2(value.f[0], value.f[1]);
+        sum[2 * pack + 1] = make_float2(value.f[2], value.f[3]);
+      }
+    }
+    #pragma unroll
+    for (int peer = 0; peer < NPeers; peer++) {
+      const auto* remote = static_cast<const __nv_bfloat16*>(remotes[peer]);
+      #pragma unroll
+      for (int pack = 0; pack < PacksPerThread; pack++) {
+        Bf16Pack8 value;
+        value.bytes = ld_volatile_global<16>(cvta_to_global(remote) + 16 * (PacksPerThread * i + pack));
+        #pragma unroll
+        for (int pair = 0; pair < 4; pair++) {
+          const float2 addend = __bfloat1622float2(value.b[pair]);
+          sum[4 * pack + pair].x += addend.x;
+          sum[4 * pack + pair].y += addend.y;
+        }
+      }
+    }
+    if (LastWindow) {
+      #pragma unroll
+      for (int pack = 0; pack < PacksPerThread; pack++) {
+        Bf16Pack8 value;
+        #pragma unroll
+        for (int pair = 0; pair < 4; pair++)
+          value.b[pair] = __floats2bfloat162_rn(sum[4 * pack + pair].x, sum[4 * pack + pair].y);
+        st_global<16>(cvta_to_global(output) + 16 * (PacksPerThread * i + pack), value.bytes);
+      }
+    } else {
+      #pragma unroll
+      for (int pack = 0; pack < ElementsPerThread / 4; pack++) {
+        FloatPack4 value;
+        value.f[0] = sum[2 * pack + 0].x;
+        value.f[1] = sum[2 * pack + 0].y;
+        value.f[2] = sum[2 * pack + 1].x;
+        value.f[3] = sum[2 * pack + 1].y;
+        st_global<16>(cvta_to_global(accum) + 16 * (4 * i + pack), value.bytes);
+      }
+    }
+  }
+  for (int i = nPacks * ElementsPerThread + tid; i < nelem; i += nthreads) {
+    float sum = FirstWindow ? __bfloat162float(local[i]) : accum[i];
+    #pragma unroll
+    for (int peer = 0; peer < NPeers; peer++) {
+      union { BytePack<2> bytes; __nv_bfloat16 value; } remote;
+      remote.bytes = ld_volatile_global<2>(cvta_to_global(static_cast<const __nv_bfloat16*>(remotes[peer]) + i));
+      sum += __bfloat162float(remote.value);
+    }
+    if (LastWindow) output[i] = __float2bfloat16(sum);
+    else accum[i] = sum;
+  }
+}
+
+template <int NPeers>
+__device__ __forceinline__ void ncclA2aFusedReducePtrs(int tid, int nthreads, const __nv_bfloat16* local,
+                                                       void* const* remotes, __nv_bfloat16* output, int nelem) {
+  ncclA2aFusedAccumulatePtrs<NPeers, true, true>(tid, nthreads, local, remotes, nullptr, output, nelem);
+}
+
 #endif

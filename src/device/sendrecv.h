@@ -13,6 +13,188 @@ template <typename T, typename RedOp>
 struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   static_assert(sizeof(T) == 1, "SendRecv only works on single byte types T.");
 
+  template <int NPeers>
+  struct A2aFusedStep {
+    const __nv_bfloat16* local;
+    __nv_bfloat16* output;
+    int cursor;
+    int remaining;
+    ncclDevWorkColl* work;
+
+    template <int SlicePerChunk, int MinSrcs, int MaxSrcs, int MinDsts, int MaxDsts, int MultimemSrcs,
+              int MultimemDsts>
+    __device__ __forceinline__ void operator()(int tid, int nthreads, int slice, int maxSliceSize, int nSrcs,
+                                               void** srcPtrs, int nDsts, void** dstPtrs, int32_t* dstSizes,
+                                               uint32_t sendDirectFlag, uint32_t recvDirectFlag) {
+      static_assert(SlicePerChunk == 1, "A2AFused requires one Simple slice per step");
+      const int nelem = min(maxSliceSize, remaining - cursor);
+      ncclA2aFusedReducePtrs<NPeers>(tid, nthreads, local + cursor, srcPtrs, output + cursor, nelem);
+    }
+  };
+
+  template <int NPeers>
+  struct A2aFusedAccumStep {
+    const __nv_bfloat16* local;
+    float* accum;
+    __nv_bfloat16* output;
+    int cursor;
+    int remaining;
+    bool firstWindow;
+    bool lastWindow;
+    ncclDevWorkColl* work;
+
+    template <int SlicePerChunk, int MinSrcs, int MaxSrcs, int MinDsts, int MaxDsts, int MultimemSrcs,
+              int MultimemDsts>
+    __device__ __forceinline__ void operator()(int tid, int nthreads, int slice, int maxSliceSize, int nSrcs,
+                                               void** srcPtrs, int nDsts, void** dstPtrs, int32_t* dstSizes,
+                                               uint32_t sendDirectFlag, uint32_t recvDirectFlag) {
+      static_assert(SlicePerChunk == 1, "A2AFused requires one Simple slice per step");
+      const int nelem = min(maxSliceSize, remaining - cursor);
+      if (firstWindow) {
+        if (lastWindow)
+          ncclA2aFusedAccumulatePtrs<NPeers, true, true>(tid, nthreads, local + cursor, srcPtrs, accum + cursor,
+                                                         output + cursor, nelem);
+        else
+          ncclA2aFusedAccumulatePtrs<NPeers, true, false>(tid, nthreads, local + cursor, srcPtrs, accum + cursor,
+                                                          output + cursor, nelem);
+      } else {
+        if (lastWindow)
+          ncclA2aFusedAccumulatePtrs<NPeers, false, true>(tid, nthreads, local + cursor, srcPtrs, accum + cursor,
+                                                          output + cursor, nelem);
+        else
+          ncclA2aFusedAccumulatePtrs<NPeers, false, false>(tid, nthreads, local + cursor, srcPtrs, accum + cursor,
+                                                           output + cursor, nelem);
+      }
+    }
+  };
+
+  template <int NPeers>
+  __device__ __forceinline__ void runA2aFusedPeers(int tid, int nthreads, struct ncclDevWorkP2p* works) {
+    static_assert(0 < NPeers && NPeers <= NCCL_MAX_DIRECT_ARITY, "Unsupported A2AFused peer count");
+    int recvPeers[NPeers];
+    #pragma unroll
+    for (int peer = 0; peer < NPeers; peer++) recvPeers[peer] = works[peer].recvRank;
+
+    const int part = ncclP2pChannelToPart(works[0].nP2pChannels, works[0].channelBase, ncclShmem.channelId);
+    size_t byteBegin, byteEnd;
+    ncclP2pPartBounds(works[0].nSendChannels, part, works[0].a2aRecvcount * sizeof(__nv_bfloat16), &byteBegin,
+                      &byteEnd);
+    const int partCount = (byteEnd - byteBegin) / sizeof(__nv_bfloat16);
+    const auto* local = static_cast<const __nv_bfloat16*>(works[0].a2aInput) +
+                        size_t(ncclShmem.comm.rank) * works[0].a2aRecvcount + byteBegin / sizeof(__nv_bfloat16);
+    auto* output = static_cast<__nv_bfloat16*>(works[0].a2aOutput) + byteBegin / sizeof(__nv_bfloat16);
+
+    // Match NCCL SendRecv's deadlock-free execution model: peer-specific send
+    // groups run concurrently with one multi-peer owner receive/reduction
+    // group, all inside this CTA.
+    // One Simple send warp per peer leaves the maximum number of workers for
+    // the owner receive/reduction side, which is the limiting stage. This also
+    // leaves receive workers at every supported rank count.
+    constexpr int sendThreads = NPeers * WARP_SIZE;
+    if (tid < sendThreads) {
+      const int work = tid / WARP_SIZE;
+      const int sendTid = tid - work * WARP_SIZE;
+      runSend<ProtoSimple<1, 1>>(sendTid, WARP_SIZE, work + 1, &works[work]);
+      return;
+    }
+
+    const int recvTid = tid - sendThreads;
+    const int recvThreads = nthreads - sendThreads;
+    using Proto = ProtoSimple<1, 1>;
+    Primitives<__nv_bfloat16, FuncSum<__nv_bfloat16>, FanAsymmetric<NPeers, 0>, 0, Proto, 1> prims(
+        recvTid, recvThreads, recvPeers, nullptr, nullptr, nullptr, 0, 0, 1, 1, nullptr, &works[0],
+        ncclShmem.comm.p2pChunkSize / sizeof(__nv_bfloat16));
+    const int stepElements = ncclShmem.comm.p2pChunkSize / sizeof(__nv_bfloat16);
+    for (int cursor = 0; cursor < partCount; cursor += stepElements) {
+      A2aFusedStep<NPeers> step{local, output, cursor, partCount, nullptr};
+      prims.template process<1, 0>(step);
+    }
+  }
+
+  template <int NPeers>
+  __device__ __forceinline__ void runA2aFusedWindow(int tid, int nthreads, struct ncclDevWorkP2p* works,
+                                                    const __nv_bfloat16* local, float* accum,
+                                                    __nv_bfloat16* output, int partCount, bool firstWindow,
+                                                    bool lastWindow) {
+    static_assert(0 < NPeers && NPeers <= NCCL_MAX_DIRECT_ARITY, "Unsupported A2AFused peer window");
+    // Keep a fixed seven send-warps layout for every window so the receiver
+    // worker IDs and Simple barrier groups do not change between windows.
+    constexpr int sendThreads = NCCL_MAX_DIRECT_ARITY * WARP_SIZE;
+    if (tid < sendThreads) {
+      const int work = tid / WARP_SIZE;
+      if (work < NPeers) runSend<ProtoSimple<1, 1>>(tid - work * WARP_SIZE, WARP_SIZE, work + 1, &works[work]);
+    } else {
+      int recvPeers[NPeers];
+      #pragma unroll
+      for (int peer = 0; peer < NPeers; peer++) recvPeers[peer] = works[peer].recvRank;
+      const int recvTid = tid - sendThreads;
+      const int recvThreads = nthreads - sendThreads;
+      using Proto = ProtoSimple<1, 1>;
+      Primitives<__nv_bfloat16, FuncSum<__nv_bfloat16>, FanAsymmetric<NPeers, 0>, 0, Proto, 1> prims(
+          recvTid, recvThreads, recvPeers, nullptr, nullptr, nullptr, 0, 0, 1, 1, nullptr, &works[0],
+          ncclShmem.comm.p2pChunkSize / sizeof(__nv_bfloat16));
+      const int stepElements = ncclShmem.comm.p2pChunkSize / sizeof(__nv_bfloat16);
+      for (int cursor = 0; cursor < partCount; cursor += stepElements) {
+        A2aFusedAccumStep<NPeers> step{local, accum, output, cursor, partCount, firstWindow, lastWindow, nullptr};
+        prims.template process<1, 0>(step);
+      }
+    }
+  }
+
+  __device__ __forceinline__ void runA2aFusedWindows(int tid, int nthreads, struct ncclDevWorkP2p* works,
+                                                     int nWorks) {
+    const int part = ncclP2pChannelToPart(works[0].nP2pChannels, works[0].channelBase, ncclShmem.channelId);
+    size_t byteBegin, byteEnd;
+    ncclP2pPartBounds(works[0].nSendChannels, part, works[0].a2aRecvcount * sizeof(__nv_bfloat16), &byteBegin,
+                      &byteEnd);
+    const int partCount = (byteEnd - byteBegin) / sizeof(__nv_bfloat16);
+    const auto* local = static_cast<const __nv_bfloat16*>(works[0].a2aInput) +
+                        size_t(ncclShmem.comm.rank) * works[0].a2aRecvcount + byteBegin / sizeof(__nv_bfloat16);
+    auto* output = static_cast<__nv_bfloat16*>(works[0].a2aOutput) + byteBegin / sizeof(__nv_bfloat16);
+    // recvAddr points at scratch[recvRank][byteBegin] after channel
+    // partitioning. Recover the scratch base without growing every peer work
+    // descriptor with another pointer.
+    auto* scratchBase = static_cast<char*>(works[0].recvAddr) -
+                        size_t(works[0].recvRank) * works[0].a2aRecvcount * sizeof(__nv_bfloat16) - byteBegin;
+    auto* accum = reinterpret_cast<float*>(scratchBase) + byteBegin / sizeof(__nv_bfloat16);
+
+    for (int base = 0; base < nWorks; base += NCCL_MAX_DIRECT_ARITY) {
+      const int peers = min(NCCL_MAX_DIRECT_ARITY, nWorks - base);
+      const bool firstWindow = base == 0;
+      const bool lastWindow = base + peers == nWorks;
+      switch (peers) {
+        case 1: runA2aFusedWindow<1>(tid, nthreads, works + base, local, accum, output, partCount, firstWindow,
+                                     lastWindow); break;
+        case 2: runA2aFusedWindow<2>(tid, nthreads, works + base, local, accum, output, partCount, firstWindow,
+                                     lastWindow); break;
+        case 3: runA2aFusedWindow<3>(tid, nthreads, works + base, local, accum, output, partCount, firstWindow,
+                                     lastWindow); break;
+        case 4: runA2aFusedWindow<4>(tid, nthreads, works + base, local, accum, output, partCount, firstWindow,
+                                     lastWindow); break;
+        case 5: runA2aFusedWindow<5>(tid, nthreads, works + base, local, accum, output, partCount, firstWindow,
+                                     lastWindow); break;
+        case 6: runA2aFusedWindow<6>(tid, nthreads, works + base, local, accum, output, partCount, firstWindow,
+                                     lastWindow); break;
+        case 7: runA2aFusedWindow<7>(tid, nthreads, works + base, local, accum, output, partCount, firstWindow,
+                                     lastWindow); break;
+      }
+      __syncthreads();
+    }
+  }
+
+  __device__ __forceinline__ void runA2aFused(int tid, int nthreads, struct ncclDevWorkP2p* works, int nWorks) {
+    if (nWorks > NCCL_MAX_DIRECT_ARITY) return runA2aFusedWindows(tid, nthreads, works, nWorks);
+    switch (nWorks) {
+      case 1: return runA2aFusedPeers<1>(tid, nthreads, works);
+      case 2: return runA2aFusedPeers<2>(tid, nthreads, works);
+      case 3: return runA2aFusedPeers<3>(tid, nthreads, works);
+      case 4: return runA2aFusedPeers<4>(tid, nthreads, works);
+      case 5: return runA2aFusedPeers<5>(tid, nthreads, works);
+      case 6: return runA2aFusedPeers<6>(tid, nthreads, works);
+      case 7: return runA2aFusedPeers<7>(tid, nthreads, works);
+    }
+  }
+
   template <typename Proto>
   __device__ void runSend(int tid, int tn, int group, struct ncclDevWorkP2p* work) {
     size_t bytes = work->sendBytes;
@@ -64,6 +246,29 @@ struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
 
     struct ncclDevWorkP2p* works = (ncclDevWorkP2p*)ncclShmem.workStorage;
     int nWorks = ncclShmem.nWorks;
+
+    if (works[0].a2aFused && nWorks > NCCL_MAX_DIRECT_ARITY) {
+      // A2AFused extension batches may contain as many as 127 descriptors.
+      // Partition every descriptor before entering the peer-window loop.
+      for (int item = tid; item < 2 * nWorks; item += tn) {
+        int workIx = item / 2;
+        int isSend = item & 1;
+        struct ncclDevWorkP2p* work = &works[workIx];
+        size_t bytes = isSend ? work->sendBytes : work->recvBytes;
+        int nParts = isSend ? work->nSendChannels : work->nRecvChannels;
+        int part = ncclP2pChannelToPart(work->nP2pChannels, work->channelBase, ncclShmem.channelId);
+        if (nParts != 0) {
+          size_t partBeg, partEnd;
+          ncclP2pPartBounds(nParts, part, bytes, &partBeg, &partEnd);
+          (isSend ? work->sendAddr : work->recvAddr) =
+              static_cast<char*>(isSend ? work->sendAddr : work->recvAddr) + partBeg;
+          (isSend ? work->sendBytes : work->recvBytes) = partEnd - partBeg;
+        }
+      }
+      __syncthreads();
+      runA2aFused(tid, tn, works, nWorks);
+      return;
+    }
 
     if (wid == 0) {
       // Modify the memory range of each work[] to reflect this channel's
@@ -120,6 +325,10 @@ struct RunWorkBatch<ncclFuncSendRecv, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPL
     uint32_t workRecvMask = shared->workRecvMask;
 
     __syncthreads(); // release scratch space used by shared->*
+    if (works[0].a2aFused) {
+      runA2aFused(tid, tn, works, nWorks);
+      return;
+    }
     if (nWorks <= workIx) return;
 
     // Thread range for whole work (send & recv combined)
