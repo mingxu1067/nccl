@@ -6,7 +6,7 @@
 #
 
 # NCCL Collective Examples
-EXAMPLES = 01_allreduce
+EXAMPLES = 01_allreduce 02_mixed_precision
 
 # Default target
 all: $(EXAMPLES)
@@ -49,6 +49,7 @@ help:
 	@echo ""
 	@echo "Examples:"
 	@echo "  01_allreduce - AllReduce collective operation"
+	@echo "  02_mixed_precision - BF16 I/O with FP32 accumulation"
 	@echo ""
 	@echo "To build/run individual examples:"
 	@echo "  make -C 01_allreduce/c"

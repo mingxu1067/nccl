@@ -26,6 +26,13 @@ verification.
   - Executes AllReduce sum across all GPUs
   - Verifies the expected global sum
 
+### [02_mixed_precision](02_mixed_precision/)
+**Mixed-Precision AllReduce and ReduceScatter**
+- **APIs**: `ncclAllReduceRingMP`, `ncclReduceScatterRingMP`,
+  `ncclAllReduceA2AMP`, and `ncclReduceScatterA2AMP`
+- **Data types**: BF16 input/output with FP32 accumulation
+- **Execution model**: One MPI process per GPU
+
 ## Choosing the Right Pattern
 
 *Scenario* : Parallel training needs efficient global communication
